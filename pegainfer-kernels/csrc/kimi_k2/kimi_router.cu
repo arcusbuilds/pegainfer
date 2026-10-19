@@ -8,7 +8,7 @@ extern thread_local cublasHandle_t g_cublas_handle;
 
 namespace {
 
-constexpr int kRouterSelectThreads = 512;
+constexpr int kRouterSelectThreads = 384;
 constexpr int kKimiExperts = 384;
 constexpr int kKimiTopk = 8;
 
@@ -34,9 +34,7 @@ __global__ void router_scores_topk_normalize_kernel(
   extern __shared__ char shared[];
   float *scores = reinterpret_cast<float *>(shared);
   float *choice_scores = scores + blockDim.x;
-  float *reduce_values = choice_scores + blockDim.x;
-  int *reduce_indices = reinterpret_cast<int *>(reduce_values + blockDim.x);
-  float *selected_scores = reinterpret_cast<float *>(reduce_indices + blockDim.x);
+  float *selected_scores = reinterpret_cast<float *>(choice_scores + blockDim.x);
 
   const int expert = tid;
   if (expert < n_experts) {
@@ -50,39 +48,22 @@ __global__ void router_scores_topk_normalize_kernel(
   if (token >= active_tokens) return;
   __syncthreads();
 
-  float selected_sum = 0.0f;
-  for (int route = 0; route < topk; ++route) {
-    reduce_values[tid] = choice_scores[tid];
-    reduce_indices[tid] = expert < n_experts ? expert : n_experts;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (tid < stride) {
-        const float other_value = reduce_values[tid + stride];
-        const int other_idx = reduce_indices[tid + stride];
-        if (better_router_choice(other_value, other_idx, reduce_values[tid], reduce_indices[tid])) {
-          reduce_values[tid] = other_value;
-          reduce_indices[tid] = other_idx;
-        }
-      }
-      __syncthreads();
+  if (expert < n_experts) {
+    const float cv = choice_scores[tid];
+    int rank = 0;
+    for (int j = 0; j < n_experts; ++j) {
+      if (better_router_choice(choice_scores[j], j, cv, expert)) ++rank;
     }
-
-    if (tid == 0) {
-      const int best_idx = reduce_indices[0];
-      const float route_score = best_idx < n_experts ? scores[best_idx] : 0.0f;
-      selected_scores[route] = route_score;
-      topk_idx[token * topk + route] = best_idx;
-      topk_weight[token * topk + route] = route_score;
-      selected_sum += route_score;
-      if (best_idx < n_experts) {
-        choice_scores[best_idx] = -CUDART_INF_F;
-      }
+    if (rank < topk) {
+      topk_idx[token * topk + rank] = expert;
+      selected_scores[rank] = scores[expert];
     }
-    __syncthreads();
   }
+  __syncthreads();
 
   if (tid == 0) {
+    float selected_sum = 0.0f;
+    for (int route = 0; route < topk; ++route) selected_sum += selected_scores[route];
     const float scale = selected_sum > 0.0f ? route_scale / selected_sum : 0.0f;
     for (int route = 0; route < topk; ++route) {
       topk_weight[token * topk + route] = selected_scores[route] * scale;
@@ -175,7 +156,7 @@ CUresult kimi_k2_router_noaux_tc_cuda(
   if (result != CUDA_SUCCESS) return result;
 
   size_t select_smem =
-      static_cast<size_t>(kRouterSelectThreads) * (3 * sizeof(float) + sizeof(int)) +
+      static_cast<size_t>(kRouterSelectThreads) * (2 * sizeof(float)) +
       static_cast<size_t>(topk) * sizeof(float);
   router_scores_topk_normalize_kernel<<<padded_tokens, kRouterSelectThreads, select_smem, stream>>>(
       logits, e_score_correction_bias, topk_weight, topk_idx, active_tokens,
