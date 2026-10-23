@@ -115,7 +115,7 @@ fn router_select_matches_host_reference() {
     }
 
     // (hidden, gate, bias, active, padded): decode batch sizes 1/8/32,
-    // active < padded, a prefill batch past the 64-row rank-count cap, every
+    // active < padded, a prefill batch past the 64-row decode cap, every
     // choice tied (zero logits and bias), tie groups, all-NaN rows and one NaN
     // expert.
     let mut cases = Vec::new();
